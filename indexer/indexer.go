@@ -1,35 +1,26 @@
 package indexer
 
 import (
+	"context"
 	"encoding/json"
-	"golang.org/x/net/context"
 	"gopkg.in/olivere/elastic.v5"
+	"log"
 )
 
+// Indexer performs indexing of items and its references using ElasticCloud
 type Indexer struct {
-	el *elastic.Client
+	ElasticSearch *elastic.Client
 }
 
-type Reference struct {
-	ParentHash string `json:"parent_hash"`
-	Name       string `json:"name"`
-}
-
-func NewIndexer(el *elastic.Client) *Indexer {
-	return &Indexer{
-		el: el,
-	}
-}
-
-// Add file or directory to index
-func (i Indexer) IndexItem(doctype string, hash string, properties map[string]interface{}) error {
-	_, err := i.el.Update().
+// IndexItem adds or updates an IPFS item with arbitrary properties
+func (i *Indexer) IndexItem(ctx context.Context, doctype string, hash string, properties map[string]interface{}) error {
+	_, err := i.ElasticSearch.Update().
 		Index("ipfs").
 		Type(doctype).
 		Id(hash).
 		Doc(properties).
 		DocAsUpsert(true).
-		Do(context.TODO())
+		Do(ctx)
 
 	if err != nil {
 		// Handle error
@@ -39,28 +30,47 @@ func (i Indexer) IndexItem(doctype string, hash string, properties map[string]in
 	return nil
 }
 
-// Return existing references for an object, or nil, and the type
-// When no object is found nil is returned but no error is set
-// Otherwise, an empty list is returned
-func (i Indexer) GetReferences(hash string) ([]Reference, string, error) {
+// extractRefrences reads the refernces from the JSON response from ElasticSearch
+func extractReferences(result *elastic.GetResult) (References, error) {
+	var parsedResult map[string]References
+
+	err := json.Unmarshal(*result.Source, &parsedResult)
+	if err != nil {
+		log.Printf("can't unmarshal references JSON: %s", *result.Source)
+		return nil, err
+	}
+
+	references := parsedResult["references"]
+
+	return references, nil
+}
+
+// GetReferences returns existing references and the type for an object.
+// When no object is found an empty list of references is returned, the
+// type is "" and no error is set.
+func (i *Indexer) GetReferences(ctx context.Context, hash string) (References, string, error) {
 	fsc := elastic.NewFetchSourceContext(true)
 	fsc.Include("references")
 
-	res, err := i.el.Get().
-		Index("ipfs").Type("_all").FetchSourceContext(fsc).Id(hash).Do(context.TODO())
+	result, err := i.ElasticSearch.
+		Get().
+		Index("ipfs").Type("_all").
+		FetchSourceContext(fsc).
+		Id(hash).
+		Do(ctx)
 
 	if err != nil {
 		if elastic.IsNotFound(err) {
-			return nil, "", nil
+			// Initialize empty references when none have been found
+			return []Reference{}, "", nil
 		}
 		return nil, "", err
 	}
 
-	var result map[string][]Reference
-	err = json.Unmarshal(*res.Source, &result)
+	references, err := extractReferences(result)
 	if err != nil {
 		return nil, "", err
 	}
 
-	return result["references"], res.Type, nil
+	return references, result.Type, nil
 }
